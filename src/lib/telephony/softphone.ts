@@ -1,0 +1,432 @@
+import { audioEngine } from "./audioEngine";
+import { encodeTelnyxClientState, isTelnyxEnabled } from "./telnyxClient";
+import {
+  createTelnyxClient,
+  type TelnyxCallIds,
+  type TelnyxCallLike,
+  type TelnyxCallNotification,
+  type TelnyxClientLike,
+  type TelnyxErrorNotification,
+} from "./telnyxClientAdapter";
+import { mapTelnyxCallState } from "./telnyxLifecycle";
+import { withTimeout } from "@/lib/withTimeout";
+import { LocalSipAdapter, type LocalSipState } from "./localSipAdapter";
+import { getActiveTelephonyAdapterClient } from "./telephonyAdapterClient";
+import type { TelephonyAdapter } from "./telephonyAdapterShared";
+import type { ScriptSnapshotDTO } from "@/lib/dal/productScripts";
+
+export const SOFTPHONE_AUDIO_INIT_TIMEOUT_MS = 10_000;
+export type CallState = "idle" | "dialing" | "ringing" | "connected" | "on_hold" | "ended" | "failed";
+
+export interface CallSession {
+  id: string;
+  leadId: string;
+  leadName: string;
+  phone: string;
+  state: CallState;
+  startTime: Date | null;
+  durationSeconds: number;
+  isMuted: boolean;
+  isOnHold: boolean;
+  errorMessage: string | null;
+  scriptSnapshot: ScriptSnapshotDTO | null;
+}
+
+export type CallStateListener = (session: CallSession) => void;
+interface DialContext { queueItemId?: string | null; productId?: string | null; }
+
+export class WebRtcSoftphoneController {
+  private currentSession: CallSession = { id: "", leadId: "", leadName: "", phone: "", state: "idle", startTime: null, durationSeconds: 0, isMuted: false, isOnHold: false, errorMessage: null, scriptSnapshot: null };
+  private listeners: Set<CallStateListener> = new Set();
+  private timerInterval: NodeJS.Timeout | null = null;
+  private dialTimers: ReturnType<typeof setTimeout>[] = [];
+  private endedResetTimer: ReturnType<typeof setTimeout> | null = null;
+  private telnyxClient: TelnyxClientLike | null = null;
+  private telnyxCall: TelnyxCallLike | null = null;
+  private telnyxSessionId: string | null = null;
+  private remoteAudio: HTMLAudioElement | null = null;
+  private telnyxClientReady = false;
+  private telnyxListenersBound = false;
+  private telnyxReadyResolve: (() => void) | null = null;
+  private telnyxReadyReject: ((error: Error) => void) | null = null;
+  private activeAdapter: TelephonyAdapter = "simulation";
+  private localSipAdapter: LocalSipAdapter | null = null;
+  private localSipSessionId: string | null = null;
+  private simulationSessionId: string | null = null;
+
+  public getSession(): CallSession { return { ...this.currentSession }; }
+
+  public subscribeState(listener: CallStateListener): () => void {
+    this.listeners.add(listener);
+    listener(this.getSession());
+    return () => this.listeners.delete(listener);
+  }
+
+  private notify() {
+    const copy = this.getSession();
+    this.listeners.forEach((fn) => fn(copy));
+  }
+
+  private clearDialTimers() {
+    this.dialTimers.forEach((timer) => clearTimeout(timer));
+    this.dialTimers = [];
+  }
+
+  private clearEndedResetTimer() {
+    if (this.endedResetTimer) {
+      clearTimeout(this.endedResetTimer);
+      this.endedResetTimer = null;
+    }
+  }
+
+  private isCurrentSession(sessionId: string, ...states: CallState[]) {
+    return this.currentSession.id === sessionId && states.includes(this.currentSession.state);
+  }
+
+  private isTelnyxActive(): boolean {
+    return this.activeAdapter === "telnyx" || (this.activeAdapter === "simulation" && isTelnyxEnabled());
+  }
+
+  private async resolveActiveAdapter(): Promise<TelephonyAdapter> {
+    try {
+      this.activeAdapter = await getActiveTelephonyAdapterClient();
+    } catch {
+      this.activeAdapter = isTelnyxEnabled() ? "telnyx" : "simulation";
+    }
+    return this.activeAdapter;
+  }
+
+  private resetToIdle() {
+    this.stopTimer();
+    if (!this.isTelnyxActive() && this.activeAdapter !== "local_sip") audioEngine.release();
+    this.telnyxCall = null;
+    this.telnyxSessionId = null;
+    this.localSipAdapter = null;
+    this.localSipSessionId = null;
+    this.simulationSessionId = null;
+    this.currentSession = { ...this.currentSession, state: "idle", startTime: null, durationSeconds: 0, isMuted: false, isOnHold: false, errorMessage: null, scriptSnapshot: null };
+    this.notify();
+  }
+
+  public async dial(leadId: string, phone: string, leadName: string, context: DialContext = {}): Promise<boolean> {
+    if (this.currentSession.state !== "idle" && this.currentSession.state !== "ended" && this.currentSession.state !== "failed") {
+      console.warn("[WebRtcSoftphone] Cannot dial while another call is active");
+      return false;
+    }
+    this.clearDialTimers();
+    this.clearEndedResetTimer();
+    this.currentSession = { id: `call-wrtc-${Date.now()}`, leadId, leadName, phone, state: "dialing", startTime: null, durationSeconds: 0, isMuted: false, isOnHold: false, errorMessage: null, scriptSnapshot: null };
+    this.notify();
+
+    const adapter = await this.resolveActiveAdapter();
+    if (adapter === "local_sip") {
+      try { return await this.dialWithLocalSip(leadId, phone, context); }
+      catch (error) { this.cancelDial(); throw error; }
+    }
+    if (adapter === "telnyx" || this.isTelnyxActive()) {
+      try { return await this.dialWithTelnyx(leadId, phone, context); }
+      catch (error) { this.cancelDial(); throw error; }
+    }
+    return this.dialWithSimulation(leadId, phone, context);
+  }
+
+  private async dialWithLocalSip(leadId: string, phone: string, context: DialContext): Promise<boolean> {
+    const bootstrapResponse = await fetch("/api/telephony/local/bootstrap", { cache: "no-store" });
+    const bootstrap = await bootstrapResponse.json() as { server?: string; aor?: string; username?: string; password?: string; expiresAt?: string; error?: string };
+    if (!bootstrapResponse.ok || !bootstrap.server || !bootstrap.aor || !bootstrap.username || !bootstrap.password || !bootstrap.expiresAt) {
+      throw new Error(bootstrap.error || "Local SIP bootstrap could not be created.");
+    }
+    if (Date.parse(bootstrap.expiresAt) <= Date.now()) throw new Error("Local SIP bootstrap expired before the call started.");
+
+    const sessionResponse = await fetch("/api/telephony/local/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+       body: JSON.stringify({ leadId, queueItemId: context.queueItemId || null, toNumber: "1002", productId: context.productId || null }),
+    });
+    const sessionBody = await sessionResponse.json() as { sessionId?: string; toNumber?: string; scriptSnapshot?: ScriptSnapshotDTO; error?: string };
+    if (!sessionResponse.ok || !sessionBody.sessionId || !sessionBody.toNumber || !sessionBody.scriptSnapshot) throw new Error(sessionBody.error || "Local SIP call session could not be created.");
+    this.localSipSessionId = sessionBody.sessionId;
+    this.remoteAudio ||= this.createRemoteAudioElement();
+    this.localSipAdapter = new LocalSipAdapter({
+      server: bootstrap.server,
+      aor: bootstrap.aor,
+      username: bootstrap.username,
+      password: bootstrap.password,
+      remoteAudio: this.remoteAudio,
+      onState: (state) => this.handleLocalSipState(state),
+      onError: (error) => this.handleLocalSipError(error),
+    });
+    await this.localSipAdapter.connect();
+    await this.localSipAdapter.register();
+    this.currentSession.id = sessionBody.sessionId;
+    this.currentSession.scriptSnapshot = sessionBody.scriptSnapshot;
+    this.notify();
+    await this.localSipAdapter.dial(`sip:${sessionBody.toNumber}@127.0.0.1`);
+    return true;
+  }
+
+  private handleLocalSipState(state: LocalSipState) {
+    if (this.currentSession.state === "idle" || this.currentSession.state === "failed") return;
+    const nextState: CallState =
+      state === "held"
+        ? "on_hold"
+        : state === "initiated"
+          ? "dialing"
+          : state;
+    void this.syncLocalSipSession(state);
+    if (nextState === "connected" && !this.currentSession.startTime) {
+      this.currentSession.startTime = new Date();
+      this.startTimer();
+    }
+    if (nextState === "ended") {
+      this.stopTimer();
+      this.currentSession.state = "ended";
+      this.notify();
+      this.scheduleReset();
+      return;
+    }
+    this.currentSession.state = nextState;
+    this.currentSession.isOnHold = nextState === "on_hold";
+    this.notify();
+  }
+
+  private handleLocalSipError(error: Error) {
+    if (["idle", "ended", "failed"].includes(this.currentSession.state)) return;
+    void this.syncLocalSipSession("failed");
+    this.stopTimer();
+    this.currentSession.state = "failed";
+    this.currentSession.errorMessage = error.message;
+    this.currentSession.isOnHold = false;
+    this.notify();
+    this.scheduleReset();
+  }
+
+  private async syncLocalSipSession(status: LocalSipState) {
+    if (!this.localSipSessionId) return;
+    await fetch("/api/telephony/local/session", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: this.localSipSessionId, status }),
+    }).catch((error) => console.warn("[Local SIP session] Could not sync state", error));
+  }
+
+  private async dialWithTelnyx(leadId: string, phone: string, context: DialContext): Promise<boolean> {
+    const sessionResponse = await fetch("/api/telephony/telnyx/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ leadId, queueItemId: context.queueItemId || null, toNumber: phone, productId: context.productId || null }),
+    });
+    const sessionBody = await sessionResponse.json() as { sessionId?: string; toNumber?: string; scriptSnapshot?: ScriptSnapshotDTO; error?: string };
+    if (!sessionResponse.ok || !sessionBody.sessionId || !sessionBody.toNumber || !sessionBody.scriptSnapshot) throw new Error(sessionBody.error || "Telnyx call session could not be created.");
+    this.telnyxSessionId = sessionBody.sessionId;
+
+    const tokenResponse = await fetch("/api/telephony/telnyx/token", { method: "POST" });
+    const tokenBody = await tokenResponse.json() as { token?: string; callerNumber?: string; error?: string };
+    if (!tokenResponse.ok || !tokenBody.token || !tokenBody.callerNumber) throw new Error(tokenBody.error || "Telnyx WebRTC token could not be issued.");
+
+    const client = this.telnyxClient || await createTelnyxClient(tokenBody.token);
+    this.telnyxClient = client;
+    this.bindTelnyxClient(client);
+    await this.ensureTelnyxReady(client);
+
+    this.currentSession.id = sessionBody.sessionId;
+    this.currentSession.scriptSnapshot = sessionBody.scriptSnapshot;
+    this.notify();
+    this.remoteAudio ||= this.createRemoteAudioElement();
+    this.telnyxCall = client.newCall({ destinationNumber: sessionBody.toNumber, callerNumber: tokenBody.callerNumber, audio: true, remoteElement: this.remoteAudio, clientState: encodeTelnyxClientState({ sessionId: sessionBody.sessionId }) });
+    this.syncTelnyxSession("initiated");
+    return true;
+  }
+
+  private async dialWithSimulation(leadId: string, phone: string, context: DialContext): Promise<boolean> {
+    const sessionResponse = await fetch("/api/telephony/simulation/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ leadId, queueItemId: context.queueItemId || null, toNumber: phone, productId: context.productId || null }),
+    });
+    const sessionBody = await sessionResponse.json() as { sessionId?: string; scriptSnapshot?: ScriptSnapshotDTO; error?: string };
+    if (!sessionResponse.ok || !sessionBody.sessionId || !sessionBody.scriptSnapshot) throw new Error(sessionBody.error || "Simulation call session could not be created.");
+    this.simulationSessionId = sessionBody.sessionId;
+    this.currentSession.id = sessionBody.sessionId;
+    this.currentSession.scriptSnapshot = sessionBody.scriptSnapshot;
+    this.notify();
+    const sessionId = this.currentSession.id;
+    return withTimeout(audioEngine.initialize(), SOFTPHONE_AUDIO_INIT_TIMEOUT_MS, "Audio initialization timed out").then((audioOk) => {
+      if (!audioOk) { if (this.isCurrentSession(sessionId, "dialing")) this.cancelDial(); return false; }
+      if (!this.isCurrentSession(sessionId, "dialing")) return false;
+      this.dialTimers.push(setTimeout(() => {
+        if (this.isCurrentSession(sessionId, "dialing")) { this.syncSimulationSession("ringing"); this.currentSession.state = "ringing"; this.notify(); }
+      }, 1500));
+      this.dialTimers.push(setTimeout(() => {
+        if (this.isCurrentSession(sessionId, "ringing")) { this.syncSimulationSession("connected"); this.currentSession.state = "connected"; this.currentSession.startTime = new Date(); audioEngine.startRecording(); this.startTimer(); this.notify(); }
+      }, 3200));
+      return true;
+    }).catch(() => { if (this.isCurrentSession(sessionId, "dialing")) this.cancelDial(); return false; });
+  }
+
+  private syncSimulationSession(status: "ringing" | "connected" | "ended" | "failed") {
+    if (!this.simulationSessionId) return;
+    void fetch("/api/telephony/simulation/session", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: this.simulationSessionId, status }),
+    }).catch((error) => console.warn("[Simulation session] Could not sync state", error));
+  }
+
+  private createRemoteAudioElement(): HTMLAudioElement {
+    const audio = document.createElement("audio");
+    audio.autoplay = true;
+    audio.setAttribute("playsinline", "true");
+    audio.style.display = "none";
+    document.body.appendChild(audio);
+    return audio;
+  }
+
+  private bindTelnyxClient(client: TelnyxClientLike) {
+    if (this.telnyxListenersBound) return;
+    this.telnyxListenersBound = true;
+    client.on("telnyx.ready", () => {
+      this.telnyxClientReady = true;
+      this.telnyxReadyResolve?.();
+      this.telnyxReadyResolve = null;
+      this.telnyxReadyReject = null;
+    });
+    client.on("telnyx.notification", (event) => this.handleTelnyxNotification(event as TelnyxCallNotification));
+    client.on("telnyx.error", (event) => this.handleTelnyxError(event as TelnyxErrorNotification));
+    client.on("telnyx.warning", (event) => console.warn("[Telnyx WebRTC warning]", this.getProviderErrorMessage(event)));
+    client.on("telnyx.socket.close", (event) => this.handleTelnyxError(event));
+    client.on("telnyx.socket.error", (event) => this.handleTelnyxError(event));
+  }
+
+  private async ensureTelnyxReady(client: TelnyxClientLike): Promise<void> {
+    if (this.telnyxClientReady) return;
+
+    let resolveReady: () => void = () => undefined;
+    let rejectReady: (error: Error) => void = () => undefined;
+    const readyPromise = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    this.telnyxReadyResolve = resolveReady;
+    this.telnyxReadyReject = rejectReady;
+
+    try {
+      await client.connect();
+      await withTimeout(readyPromise, SOFTPHONE_AUDIO_INIT_TIMEOUT_MS, "Telnyx client readiness timed out");
+    } finally {
+      if (this.telnyxReadyResolve === resolveReady) this.telnyxReadyResolve = null;
+      if (this.telnyxReadyReject === rejectReady) this.telnyxReadyReject = null;
+    }
+  }
+
+  private getProviderErrorMessage(event: unknown): string {
+    if (event && typeof event === "object" && "error" in event) {
+      const error = (event as { error?: unknown }).error;
+      if (error instanceof Error) return error.message;
+      if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return error.message;
+    }
+    if (event && typeof event === "object" && "reason" in event && typeof event.reason === "string") return event.reason;
+    return "Connection failed.";
+  }
+
+  private handleTelnyxError(notification: unknown) {
+    const error = new Error(this.getProviderErrorMessage(notification));
+    this.telnyxReadyReject?.(error);
+    this.telnyxReadyResolve = null;
+    this.telnyxReadyReject = null;
+    if (["idle", "ended", "failed"].includes(this.currentSession.state)) return;
+
+    this.stopTimer();
+    this.syncTelnyxSession("failed");
+    this.currentSession.state = "failed";
+    this.currentSession.isOnHold = false;
+    this.currentSession.errorMessage = error.message;
+    this.notify();
+    this.scheduleReset();
+    this.telnyxCall = null;
+    this.telnyxClient = null;
+    this.telnyxClientReady = false;
+    this.telnyxListenersBound = false;
+  }
+
+  private handleTelnyxNotification(notification: TelnyxCallNotification) {
+    const call = notification.call || this.telnyxCall;
+    if (call) this.telnyxCall = call;
+    const providerState = call?.state ? mapTelnyxCallState(call.state) : null;
+    const state: CallState | null = providerState === "held"
+      ? "on_hold"
+      : providerState === "connected" || providerState === "ringing" || providerState === "ended"
+        ? providerState
+        : null;
+    if (!state || this.currentSession.state === "idle" || this.currentSession.state === "failed") return;
+    if (call) this.syncTelnyxSession(state === "connected" ? "connected" : state === "on_hold" ? "held" : state === "ended" ? "ended" : "ringing", call.telnyxIDs);
+    if (state === "connected" && !this.currentSession.startTime) { this.currentSession.startTime = new Date(); this.startTimer(); }
+    if (state === "ended") { this.stopTimer(); this.currentSession.state = "ended"; this.notify(); this.scheduleReset(); return; }
+    this.currentSession.state = state;
+    this.currentSession.isOnHold = state === "on_hold";
+    this.notify();
+  }
+
+  private syncTelnyxSession(status: "initiated" | "ringing" | "connected" | "held" | "ended" | "failed", ids?: Partial<TelnyxCallIds>) {
+    if (!this.telnyxSessionId) return;
+    void fetch("/api/telephony/telnyx/session", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: this.telnyxSessionId, status, telnyxCallControlId: ids?.telnyxCallControlId, telnyxCallSessionId: ids?.telnyxSessionId, telnyxCallLegId: ids?.telnyxLegId }) }).catch((error) => console.warn("[Telnyx session] Could not sync state", error));
+  }
+
+  public async answer(): Promise<boolean> {
+    if (this.isTelnyxActive()) { if (!this.telnyxCall) return false; await this.telnyxCall.answer(); return true; }
+    if (this.activeAdapter === "local_sip") return false;
+    let audioOk = false;
+    try { audioOk = await withTimeout(audioEngine.initialize(), SOFTPHONE_AUDIO_INIT_TIMEOUT_MS, "Audio initialization timed out"); } catch { audioOk = false; }
+    if (!audioOk) { this.resetToIdle(); return false; }
+    this.currentSession.state = "connected"; this.currentSession.startTime = new Date(); audioEngine.startRecording(); this.startTimer(); this.notify(); return true;
+  }
+
+  public hangup() {
+    if (this.currentSession.state === "idle" || this.currentSession.state === "ended" || this.currentSession.state === "failed") return;
+    if (this.isTelnyxActive() && this.telnyxCall) void this.telnyxCall.hangup();
+    if (this.activeAdapter === "local_sip" && this.localSipAdapter) void this.localSipAdapter.hangup();
+    if (this.currentSession.state === "dialing" || this.currentSession.state === "ringing") { this.cancelDial(); return; }
+    const sessionId = this.currentSession.id;
+    this.clearDialTimers(); this.clearEndedResetTimer(); this.stopTimer();
+    if (!this.isTelnyxActive() && this.activeAdapter !== "local_sip") audioEngine.release();
+    if (this.activeAdapter === "local_sip") void this.syncLocalSipSession("ended");
+    else if (this.activeAdapter === "simulation") this.syncSimulationSession("ended");
+    else this.syncTelnyxSession("ended");
+    this.currentSession.state = "ended"; this.notify();
+    this.endedResetTimer = setTimeout(() => { if (this.currentSession.id === sessionId && ["ended", "failed"].includes(this.currentSession.state)) this.resetToIdle(); }, 2000);
+  }
+
+  public cancelDial(): boolean {
+    if (this.currentSession.state !== "dialing" && this.currentSession.state !== "ringing") return false;
+    if (this.isTelnyxActive() && this.telnyxCall) void this.telnyxCall.hangup();
+    if (this.activeAdapter === "local_sip" && this.localSipAdapter) {
+      void this.localSipAdapter.hangup();
+      void this.syncLocalSipSession("failed");
+    } else if (this.activeAdapter === "simulation") this.syncSimulationSession("failed");
+    else this.syncTelnyxSession("failed");
+    this.clearDialTimers(); this.clearEndedResetTimer(); this.resetToIdle(); return true;
+  }
+
+  public toggleMute(): boolean {
+    if (this.isTelnyxActive() && this.telnyxCall) { this.telnyxCall.toggleAudioMute(); this.currentSession.isMuted = !this.currentSession.isMuted; }
+    else if (this.activeAdapter === "local_sip" && this.localSipAdapter) this.currentSession.isMuted = this.localSipAdapter.toggleMute();
+    else this.currentSession.isMuted = audioEngine.toggleMute();
+    this.notify(); return this.currentSession.isMuted;
+  }
+
+  public toggleHold(): boolean {
+    if (this.isTelnyxActive() && this.telnyxCall) { void this.telnyxCall.toggleHold(); this.currentSession.isOnHold = !this.currentSession.isOnHold; this.currentSession.state = this.currentSession.isOnHold ? "on_hold" : "connected"; }
+    else if (this.activeAdapter === "local_sip" && this.localSipAdapter) void this.localSipAdapter.toggleHold();
+    else if (this.currentSession.state === "connected") { this.currentSession.state = "on_hold"; this.currentSession.isOnHold = true; }
+    else if (this.currentSession.state === "on_hold") { this.currentSession.state = "connected"; this.currentSession.isOnHold = false; }
+    this.notify(); return this.currentSession.isOnHold;
+  }
+
+  public sendDtmf(digit: string) { if (this.isTelnyxActive() && this.telnyxCall) this.telnyxCall.dtmf(digit); else if (this.activeAdapter === "local_sip" && this.localSipAdapter) void this.localSipAdapter.sendDtmf(digit); else console.log(`[WebRtcSoftphone] Transmitting DTMF Tone: ${digit}`); }
+
+  private scheduleReset() { const sessionId = this.currentSession.id; this.clearEndedResetTimer(); this.endedResetTimer = setTimeout(() => { if (this.currentSession.id === sessionId && ["ended", "failed"].includes(this.currentSession.state)) this.resetToIdle(); }, 2000); }
+  private startTimer() { this.stopTimer(); this.timerInterval = setInterval(() => { if (this.currentSession.state === "connected" || this.currentSession.state === "on_hold") { this.currentSession.durationSeconds += 1; this.notify(); } }, 1000); }
+  private stopTimer() { if (this.timerInterval) { clearInterval(this.timerInterval); this.timerInterval = null; } }
+}
+
+export const softphoneController = new WebRtcSoftphoneController();

@@ -1,0 +1,109 @@
+import "server-only";
+
+import type { Database } from "@/lib/supabase/types";
+import { DataAccessError } from "./errors";
+import { requireWorkspaceContext } from "./workspace";
+import { createDataClient } from "./db";
+import { validateCallFailFields } from "@/lib/postCall";
+import { reviewCompletedCallForWorkspace } from "@/lib/dal/callQualityReviews";
+
+type CallRow = Database["public"]["Tables"]["calls"]["Row"];
+type CallOutcome = CallRow["outcome"];
+
+export type CallDTO = Pick<
+  CallRow,
+  | "id"
+  | "workspace_id"
+  | "lead_id"
+  | "agent_id"
+  | "duration_seconds"
+  | "outcome"
+  | "fail_reason"
+  | "operator_note"
+  | "transcript"
+  | "ai_sentiment"
+  | "created_at"
+>;
+
+export interface CreateCallInput {
+  lead_id?: string | null;
+  duration_seconds?: number;
+  outcome?: CallOutcome;
+  transcript?: string | null;
+  ai_sentiment?: string | null;
+  fail_reason?: CallRow["fail_reason"];
+  operator_note?: string | null;
+}
+
+export async function createCallForWorkspace(
+  input: CreateCallInput,
+  workspaceId?: string
+): Promise<CallDTO> {
+  const outcome = input.outcome || "completed";
+  const operatorNote = input.operator_note || "";
+  const failError = validateCallFailFields({ outcome, failReason: input.fail_reason, note: operatorNote });
+  if (failError) {
+    throw new DataAccessError("VALIDATION", failError);
+  }
+
+  if (
+    input.duration_seconds !== undefined &&
+    (!Number.isInteger(input.duration_seconds) || input.duration_seconds < 0)
+  ) {
+    throw new DataAccessError("VALIDATION", "Call duration must be a non-negative integer");
+  }
+
+  if (input.transcript && input.transcript.length > 100_000) {
+    throw new DataAccessError("VALIDATION", "Call transcript is too long");
+  }
+
+  const context = await requireWorkspaceContext(workspaceId);
+  const supabase = await createDataClient();
+
+  let leadTeamId: string | null = null;
+  if (input.lead_id) {
+    const { data: lead, error } = await supabase
+      .from("leads")
+      .select("id, team_id")
+      .eq("id", input.lead_id)
+      .eq("workspace_id", context.workspaceId)
+      .maybeSingle();
+
+    if (error) {
+      throw new DataAccessError("DATABASE", "Call lead lookup failed");
+    }
+    if (!lead) {
+      throw new DataAccessError("VALIDATION", "Call lead does not belong to workspace");
+    }
+    leadTeamId = lead.team_id;
+  }
+
+  const { data, error } = await supabase
+    .from("calls")
+    .insert({
+      workspace_id: context.workspaceId,
+      team_id: leadTeamId,
+      lead_id: input.lead_id || null,
+      agent_id: context.userId,
+      duration_seconds: input.duration_seconds ?? 0,
+      outcome,
+      transcript: input.transcript || null,
+      ai_sentiment: input.ai_sentiment || "Neutral",
+      fail_reason: input.fail_reason || null,
+      operator_note: operatorNote.trim() || null,
+    })
+    .select("id, workspace_id, lead_id, agent_id, duration_seconds, outcome, fail_reason, operator_note, transcript, ai_sentiment, created_at")
+    .single();
+
+  if (error || !data) {
+    throw new DataAccessError("DATABASE", "Call creation failed");
+  }
+
+  try {
+    await reviewCompletedCallForWorkspace(data.id, context.workspaceId);
+  } catch (reviewError) {
+    console.warn("Call quality review could not be queued; the call remains saved.", reviewError);
+  }
+
+  return data as CallDTO;
+}

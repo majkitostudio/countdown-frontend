@@ -1,0 +1,64 @@
+import Link from "next/link";
+import { LockKeyhole, Phone } from "lucide-react";
+import { DataAccessError } from "@/lib/dal/errors";
+import { getWorkspaceTelephonySettings } from "@/lib/dal/telephonySettings";
+import { requireWorkspaceRole } from "@/lib/dal/workspace";
+import { TelephonyAdminPanel } from "@/components/telephony/TelephonyAdminPanel";
+import { PageHeader } from "@/components/layout/PageHeader";
+import { Surface } from "@/components/ui/Surface";
+import { getButtonClassName } from "@/components/ui/Button";
+
+type TelephonyPageLoadResult =
+  | { settings: Awaited<ReturnType<typeof getWorkspaceTelephonySettings>> }
+  | { error: unknown };
+
+async function loadTelephonyPage(): Promise<TelephonyPageLoadResult> {
+  try {
+    await requireWorkspaceRole(["administrator"]);
+    return { settings: await getWorkspaceTelephonySettings() };
+  } catch (error) {
+    return { error };
+  }
+}
+
+export default async function TelephonyPage() {
+  const result = await loadTelephonyPage();
+
+  if ("error" in result) {
+    const forbidden = result.error instanceof DataAccessError && result.error.code === "FORBIDDEN";
+    return (
+      <div className="mx-auto max-w-xl">
+      <Surface variant="empty">
+        <LockKeyhole className="mx-auto mb-4 h-8 w-8 text-zinc-500" />
+        <h1 className="text-base font-semibold text-zinc-100">Telephony administration unavailable</h1>
+        <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-zinc-500">{forbidden ? "Only a workspace Administrator can access Local SIP administration." : "Telephony status could not be loaded."}</p>
+      </Surface>
+      </div>
+    );
+  }
+
+  if (result.settings.active_adapter !== "local_sip") {
+    return (
+      <div className="mx-auto max-w-xl">
+      <Surface variant="empty">
+        <LockKeyhole className="mx-auto mb-4 h-8 w-8 text-zinc-500" />
+        <h1 className="text-base font-semibold text-zinc-100">Local SIP is not active.</h1>
+        <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-zinc-500">Enable Local SIP in Admin Settings to use this page.</p>
+        <Link
+          href="/settings#telephony-adapter"
+          className={getButtonClassName("secondary")}
+        >
+          Open Telephony adapter settings
+        </Link>
+      </Surface>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto max-w-screen-2xl space-y-8">
+      <PageHeader icon={Phone} title="Local SIP" badge={{ label: "Administrator only", tone: "neutral" }} backLink={{ href: "/settings#telephony-adapter", label: "Back to Settings" }} description="Local Asterisk console for internal CRM telephony testing." />
+      <TelephonyAdminPanel settings={result.settings} />
+    </div>
+  );
+}

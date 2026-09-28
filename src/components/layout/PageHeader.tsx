@@ -1,0 +1,98 @@
+import Link from "next/link";
+import { ArrowLeft, type LucideIcon } from "lucide-react";
+import type { ReactNode } from "react";
+import { getStatusClassName, type SemanticTone } from "@/components/ui/Status";
+import { getSurfaceClassName } from "@/components/ui/Surface";
+import { cn } from "@/lib/utils";
+
+export type PageHeaderBadgeTone = "neutral" | "success" | "warning" | "unavailable";
+
+export interface PageHeaderBadge {
+  label: ReactNode;
+  tone?: PageHeaderBadgeTone;
+}
+
+export interface PageHeaderProps {
+  icon: LucideIcon;
+  title: string;
+  description?: ReactNode;
+  badge?: PageHeaderBadge;
+  backLink?: {
+    href: string;
+    label: string;
+  };
+  actions?: ReactNode;
+  actionsLayout?: "inline" | "stacked";
+  className?: string;
+}
+
+export function getPageHeaderBadgeClassName(tone: PageHeaderBadgeTone = "neutral"): string {
+  const semanticTone: SemanticTone = tone === "unavailable" ? "neutral" : tone;
+  return getStatusClassName(semanticTone);
+}
+
+export function getPageHeaderSurfaceClassName(): string {
+  return getSurfaceClassName("page");
+}
+
+export function PageHeader({
+  icon: Icon,
+  title,
+  description,
+  badge,
+  backLink,
+  actions,
+  actionsLayout = "inline",
+  className,
+}: PageHeaderProps) {
+  return (
+    <header
+      className={cn(
+        "flex flex-col gap-5 p-6 sm:p-8",
+        actionsLayout === "inline" && "md:flex-row md:items-center md:justify-between",
+        getPageHeaderSurfaceClassName(),
+        className
+      )}
+    >
+      <div className="min-w-0 flex-1 space-y-1.5">
+        {backLink && (
+          <Link
+            href={backLink.href}
+            className="mb-2 inline-flex items-center gap-1.5 text-xs text-zinc-500 transition-colors hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
+            {backLink.label}
+          </Link>
+        )}
+        <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+          <h1 className="flex min-w-0 items-center gap-2.5 break-words text-xl font-semibold tracking-tight text-zinc-100">
+            <Icon className="h-5 w-5 shrink-0 text-zinc-400" aria-hidden="true" />
+            <span>{title}</span>
+          </h1>
+          {badge && (
+            <span
+              className={cn(
+                "inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[10px] font-mono",
+                getPageHeaderBadgeClassName(badge.tone)
+              )}
+            >
+              {badge.label}
+            </span>
+          )}
+        </div>
+        {description && <p className="max-w-3xl text-xs leading-relaxed text-zinc-400">{description}</p>}
+      </div>
+
+      {actions && (
+        <div
+          className={cn(
+            "flex w-full flex-wrap items-center gap-2",
+            actionsLayout === "inline" ? "md:w-auto md:justify-end" : "justify-start",
+          )}
+        >
+          {actions}
+        </div>
+      )}
+    </header>
+  );
+}

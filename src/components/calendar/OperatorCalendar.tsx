@@ -1,0 +1,322 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import {
+  Bell,
+  CalendarClock,
+  CalendarDays,
+  Check,
+  CheckCircle2,
+  Clock3,
+  ExternalLink,
+  Pencil,
+  Plus,
+  RefreshCw,
+  X,
+} from "lucide-react";
+import {
+  cancelReminderAction,
+  completeReminderAction,
+  createReminderAction,
+  listCalendarEntriesAction,
+  updateReminderAction,
+} from "@/app/actions/calendar";
+import type { CalendarEntryDTO, CalendarLoadResult } from "@/lib/dal/calendar";
+import { Button } from "@/components/ui/Button";
+import { Dialog } from "@/components/ui/Dialog";
+import { FieldLabel, TextAreaField, TextField } from "@/components/ui/Field";
+import { StatusAlert, StatusBadge, type SemanticTone } from "@/components/ui/Status";
+import { Surface } from "@/components/ui/Surface";
+
+type CalendarFilter = "all" | "callback" | "reminder";
+
+interface OperatorCalendarProps {
+  initialCalendar: CalendarLoadResult;
+}
+
+interface ReminderFormState {
+  title: string;
+  note: string;
+  dueAt: string;
+  remindAt: string;
+}
+
+function toLocalInputValue(value: Date): string {
+  const offset = value.getTimezoneOffset();
+  return new Date(value.getTime() - offset * 60_000).toISOString().slice(0, 16);
+}
+
+function defaultFormState(): ReminderFormState {
+  const due = new Date(Date.now() + 60 * 60 * 1000);
+  const remind = new Date(due.getTime() - 15 * 60 * 1000);
+  return {
+    title: "",
+    note: "",
+    dueAt: toLocalInputValue(due),
+    remindAt: toLocalInputValue(remind),
+  };
+}
+
+function formatDate(value: string): string {
+  return new Intl.DateTimeFormat("cs-CZ", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
+function isDue(entry: CalendarEntryDTO): boolean {
+  return entry.status !== "completed" && Date.parse(entry.starts_at) <= Date.now();
+}
+
+function isReminderDue(entry: CalendarEntryDTO): boolean {
+  return entry.type === "reminder" && entry.status === "open" && Boolean(entry.remind_at) && Date.parse(entry.remind_at as string) <= Date.now();
+}
+
+function entryStatus(entry: CalendarEntryDTO): { label: string; tone: SemanticTone } {
+  if (entry.status === "completed") {
+    return { label: "Completed", tone: "success" };
+  }
+  if (isDue(entry)) {
+    return { label: entry.type === "callback" ? "Due" : "Overdue", tone: "warning" };
+  }
+  return { label: entry.type === "callback" ? "Scheduled" : "Open", tone: "neutral" };
+}
+
+function toIso(localValue: string, label: string): string {
+  const parsed = new Date(localValue);
+  if (!localValue || !Number.isFinite(parsed.getTime())) {
+    throw new Error(`${label} musí být platné datum a čas.`);
+  }
+  return parsed.toISOString();
+}
+
+const SOURCE_LABELS = {
+  callbacks: "Callbacks",
+  reminders: "Reminders",
+} satisfies Record<keyof CalendarLoadResult["sources"], string>;
+
+type CalendarSourceKey = keyof CalendarLoadResult["sources"];
+type UnavailableCalendarSource = Extract<CalendarLoadResult["sources"][CalendarSourceKey], { state: "unavailable" }>;
+
+export function OperatorCalendar({ initialCalendar }: OperatorCalendarProps) {
+  const [calendar, setCalendar] = useState(initialCalendar);
+  const [filter, setFilter] = useState<CalendarFilter>("all");
+  const [form, setForm] = useState<ReminderFormState>(defaultFormState);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [isEditorOpen, setIsEditorOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const entries = calendar.entries;
+
+  const refresh = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      setCalendar(await listCalendarEntriesAction());
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Calendar could not be refreshed.");
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => void refresh(), 60_000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
+  const visibleEntries = useMemo(
+    () => entries.filter((entry) => filter === "all" || entry.type === filter),
+    [entries, filter],
+  );
+  const dueReminders = entries.filter(isReminderDue);
+  const unavailableSources = (Object.entries(calendar.sources) as Array<[CalendarSourceKey, CalendarLoadResult["sources"][CalendarSourceKey]]>)
+    .flatMap(([sourceKey, source]) => (
+      source.state === "unavailable"
+        ? [{ sourceKey, source: source as UnavailableCalendarSource }]
+        : []
+    ));
+
+  const openCreate = () => {
+    setEditingId(null);
+    setForm(defaultFormState());
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setIsEditorOpen(true);
+  };
+
+  const openEdit = (entry: CalendarEntryDTO) => {
+    if (entry.type !== "reminder" || !entry.reminder) return;
+    setEditingId(entry.id);
+    setForm({
+      title: entry.reminder.title,
+      note: entry.reminder.note || "",
+      dueAt: toLocalInputValue(new Date(entry.reminder.due_at)),
+      remindAt: toLocalInputValue(new Date(entry.reminder.remind_at)),
+    });
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setIsEditorOpen(true);
+  };
+
+  const saveReminder = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setIsLoading(true);
+    try {
+      const input = {
+        title: form.title,
+        note: form.note || null,
+        due_at: toIso(form.dueAt, "Due time"),
+        remind_at: toIso(form.remindAt, "Reminder time"),
+      };
+      if (editingId) await updateReminderAction(editingId, input);
+      else await createReminderAction(input);
+      await refresh();
+      setIsEditorOpen(false);
+      setSuccessMessage(editingId ? "Reminder byl upraven." : "Reminder byl uložen.");
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Reminder could not be saved.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const runReminderAction = async (entry: CalendarEntryDTO, action: () => Promise<unknown>, message: string) => {
+    setBusyId(entry.id);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      await action();
+      await refresh();
+      setSuccessMessage(message);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Reminder action could not be completed.");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <Surface variant="page">
+    <section className="space-y-5 p-6">
+      {dueReminders.length > 0 && (
+        <StatusAlert tone="warning" role="status">
+          <Bell className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <div className="text-xs font-semibold">Připomínka je splatná</div>
+            <div className="mt-1 text-xs text-amber-200/75">{dueReminders.map((entry) => entry.title).join(" · ")}</div>
+          </div>
+        </StatusAlert>
+      )}
+
+      {unavailableSources.length > 0 && (
+        <StatusAlert tone="warning" role="status">
+          {unavailableSources.map(({ sourceKey, source }) => (
+            <p key={sourceKey}>
+              {SOURCE_LABELS[sourceKey]} unavailable: {source.message}
+            </p>
+          ))}
+        </StatusAlert>
+      )}
+
+      <div className="flex flex-col justify-between gap-4 md:flex-row md:items-start">
+        <div>
+          <div className="flex items-center gap-3">
+            <CalendarDays className="h-4 w-4 text-zinc-400" />
+            <h2 className="text-sm font-semibold text-zinc-100">Upcoming work</h2>
+          </div>
+          <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+            Zobrazení obsahuje minulých 7 dní a následujících 14 dní. Časová zóna: {Intl.DateTimeFormat().resolvedOptions().timeZone}.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" variant="secondary" onClick={() => void refresh()} disabled={isLoading}>
+            <RefreshCw className={isLoading ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} /> Refresh
+          </Button>
+          <Button type="button" onClick={openCreate}>
+            <Plus className="h-3.5 w-3.5" /> New reminder
+          </Button>
+        </div>
+      </div>
+
+      {successMessage && <StatusAlert tone="success" role="status">{successMessage}</StatusAlert>}
+      {errorMessage && <StatusAlert tone="danger">{errorMessage}</StatusAlert>}
+
+      <div className="flex flex-wrap gap-2">
+        {(["all", "callback", "reminder"] as CalendarFilter[]).map((value) => (
+          <button key={value} type="button" onClick={() => setFilter(value)} className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${filter === value ? "border-zinc-600 bg-zinc-800 text-zinc-100" : "border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-zinc-300"}`}>
+            {value === "all" ? "All" : value === "callback" ? "Callbacks" : "Reminders"}
+          </button>
+        ))}
+      </div>
+
+      {visibleEntries.length === 0 ? (
+        <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-10 text-center text-xs text-zinc-500">Žádné callbacky ani reminders v tomto období.</div>
+      ) : (
+        <div className="space-y-3">
+          {visibleEntries.map((entry) => {
+            const status = entryStatus(entry);
+            const isBusy = busyId === entry.id;
+            return (
+              <article key={`${entry.type}-${entry.id}`} className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+                <div className="flex flex-col justify-between gap-3 md:flex-row md:items-start">
+                  <div className="flex min-w-0 items-start gap-3">
+                    <div className="mt-0.5 rounded-lg bg-zinc-900 p-2 text-zinc-300">
+                      {entry.type === "callback" ? <CalendarClock className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-sm font-medium text-zinc-100">{entry.title}</h3>
+                        <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-400">
+                        <span className="inline-flex items-center gap-1.5"><Clock3 className="h-3.5 w-3.5 text-zinc-600" />{formatDate(entry.starts_at)}</span>
+                        {entry.remind_at && <span className="inline-flex items-center gap-1.5"><Bell className="h-3.5 w-3.5 text-zinc-600" />Reminder {formatDate(entry.remind_at)}</span>}
+                      </div>
+                      {entry.lead && <div className="mt-2 text-xs text-zinc-500">Lead: {entry.lead.full_name} · {entry.lead.phone}</div>}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    {entry.lead && <Link href={`/leads/${entry.lead.id}`} className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-800 px-2.5 py-2 text-[11px] text-zinc-400 hover:border-zinc-700 hover:text-zinc-200"><ExternalLink className="h-3.5 w-3.5" /> Open lead</Link>}
+                    {entry.type === "reminder" && entry.status === "open" && <>
+                      <button type="button" onClick={() => openEdit(entry)} disabled={isBusy} className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-800 px-2.5 py-2 text-[11px] text-zinc-400 hover:border-zinc-700 hover:text-zinc-200 disabled:opacity-50"><Pencil className="h-3.5 w-3.5" /> Edit</button>
+                      <Button type="button" variant="secondary" onClick={() => void runReminderAction(entry, () => completeReminderAction(entry.id), "Reminder byl dokončen.")} disabled={isBusy}><Check className="h-3.5 w-3.5" /> Complete</Button>
+                      <button type="button" onClick={() => void runReminderAction(entry, () => cancelReminderAction(entry.id), "Reminder byl zrušen.")} disabled={isBusy} className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-800 px-2.5 py-2 text-[11px] text-zinc-500 hover:text-zinc-300 disabled:opacity-50"><X className="h-3.5 w-3.5" /> Cancel</button>
+                    </>}
+                    {entry.status === "completed" && <CheckCircle2 className="h-4 w-4 text-zinc-400" aria-label="Completed" />}
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+
+      <Dialog isOpen={isEditorOpen} onClose={() => setIsEditorOpen(false)} aria-labelledby="reminder-dialog-title" size="md">
+          <form onSubmit={saveReminder} className="w-full space-y-5 p-6">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 id="reminder-dialog-title" className="text-base font-semibold text-zinc-100">{editingId ? "Edit reminder" : "New reminder"}</h2>
+                <p className="mt-1 text-xs text-zinc-500">Reminder je osobní pracovní úkol a nemění callback queue.</p>
+              </div>
+              <Button type="button" variant="quiet" onClick={() => setIsEditorOpen(false)} aria-label="Close"><X className="h-4 w-4" /></Button>
+            </div>
+            <FieldLabel htmlFor="reminder-title">Title</FieldLabel>
+            <TextField id="reminder-title" value={form.title} onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))} maxLength={200} required placeholder="Např. Ověřit platbu objednávky" />
+            <FieldLabel htmlFor="reminder-note">Note <span className="text-text-muted">(optional)</span></FieldLabel>
+            <TextAreaField id="reminder-note" value={form.note} onChange={(event) => setForm((current) => ({ ...current, note: event.target.value }))} maxLength={2000} rows={3} placeholder="Kontext pro sebe…" />
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div><FieldLabel htmlFor="reminder-due">Due</FieldLabel><TextField id="reminder-due" type="datetime-local" value={form.dueAt} onChange={(event) => setForm((current) => ({ ...current, dueAt: event.target.value }))} required /></div>
+              <div><FieldLabel htmlFor="reminder-remind-at">Remind me</FieldLabel><TextField id="reminder-remind-at" type="datetime-local" value={form.remindAt} onChange={(event) => setForm((current) => ({ ...current, remindAt: event.target.value }))} required /></div>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-zinc-800 pt-4"><Button type="button" variant="secondary" onClick={() => setIsEditorOpen(false)}>Cancel</Button><Button type="submit" disabled={isLoading}><Check className="h-3.5 w-3.5" />{isLoading ? "Saving…" : "Save reminder"}</Button></div>
+          </form>
+      </Dialog>
+    </section>
+    </Surface>
+  );
+}
